@@ -514,9 +514,9 @@ _PAGE = _b64.b64decode("PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+Cjxt
 def home():
     return Response(_PAGE, mimetype='text/html')
 
-@app.route('/welcome1.png')
-def welcome1_png():
-    p = os.path.join(os.path.dirname(__file__), 'welcome1.png')
+@app.route('/welcome.png')
+def welcome_png():
+    p = os.path.join(os.path.dirname(__file__), 'welcome.png')
     return send_file(p, mimetype='image/png') if os.path.exists(p) else ('', 404)
 
 @app.route('/api/process', methods=['POST'])
