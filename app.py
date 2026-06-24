@@ -324,7 +324,7 @@ DIM_UNIT_RE = re.compile(r"(cm|mm|m\b|in\b|inch|inches|ft|foot|feet)", re.I)
 def _norm(s):
     return re.sub(r"[^a-z0-9]", "", str(s).lower()) if s is not None else ""
 
-def find_header_row(ws, max_scan=30):
+def find_header_row(ws, max_scan=5):
     """Header row = the first row (within the first few) that looks like column
     titles for length/width/height + a description/case column."""
     best, best_score = 1, -1
@@ -409,93 +409,87 @@ def bclass(h_ft):
     return 3 if h_ft > 14.5 else 2 if h_ft > 10 else 1 if h_ft > 8.5 else 0
 
 # -------------------------------------------------------------- main entry ---
-def _scan(ws):
-    hr = find_header_row(ws)
-    headers, col = detect_columns(ws, hr)
-    lc, wc, hc, wtc, ul, uw = pick_dims(col)
-    return hr, headers, col, lc, wc, hc, wtc, ul, uw
+def process(file_bytes, filename="manifest.xlsx"):
+    """Run the full pipeline. Returns (output_xlsx_bytes, summary_dict)."""
+    wb, xlsx_bytes = load_any(file_bytes, filename)
+    # pick the CARGO tab: the sheet whose headers actually have L/W/H/Weight
+    # (handles multi-tab files with Info / Rate-Table / etc. sheets)
+    best = None
+    for sh in wb.worksheets:
+        if sh.max_row < 2:
+            continue
+        hr = find_header_row(sh)
+        hdrs, c = detect_columns(sh, hr)
+        a, b, d, e, uu, ww = pick_dims(c)
+        sc = sum(x is not None for x in (a, b, d, e))   # how many dim cols found
+        key = (sc, sh.max_row * sh.max_column)
+        if best is None or key > best[0]:
+            best = (key, sh, hr, hdrs, c, a, b, d, e, uu, ww)
+    if best is None or best[0][0] < 4:
+        raise ValueError("Couldn't find a tab with Length/Width/Height/Weight columns. "
+                         "If the cargo list is on a specific tab, make sure that tab has those headers.")
+    _, ws, header_row, headers, col, lc, wc, hc, wtc, ul, uw = best
 
-def _rows_for(ws, hr, col, lc, wc, hc, wtc, ul, uw):
-    items, skip = {}, {"consolidated": 0, "zero": 0}
-    for r in range(hr + 1, ws.max_row + 1):
+    items, spec_rows, skipped = {}, [], {"consolidated": 0, "zero": 0}
+    for r in range(header_row + 1, ws.max_row + 1):
         lv = ws.cell(r, lc).value
         case = ws.cell(r, col["case"]).value if col["case"] else None
         desc = ws.cell(r, col["desc"]).value if col["desc"] else None
         if lv is None and case is None and desc is None:
             continue
         if case and "onsolidat" in str(case):
-            skip["consolidated"] += 1; continue
+            skipped["consolidated"] += 1
+            continue
         L, W, H, WT = num(lv), num(ws.cell(r, wc).value), num(ws.cell(r, hc).value), num(ws.cell(r, wtc).value)
         if (L in (0, None)) and (WT in (0, None)):
-            skip["zero"] += 1; continue
+            skipped["zero"] += 1
+            continue
         Lf, Wf, Hf = feet(L, ul), feet(W, ul), feet(H, ul)
         wt_lb = WT if uw == "lb" else WT * 2.20462262
-        items[r] = dict(L=Lf, W=Wf, H=Hf, wt=wt_lb, rk=bclass(Hf), ow=Wf > 8.5)
-    return items, skip
+        cls = bclass(Hf)
+        items[r] = dict(L=Lf, W=Wf, H=Hf, wt=wt_lb, rk=cls, ow=Wf > 8.5)
+        spec_rows.append((r, L, W, H, WT))
 
-def process(file_bytes, filename="manifest.xlsx"):
-    """Run the full pipeline over EVERY cargo tab. Returns (xlsx_bytes, summary)."""
-    import tempfile, os
-    from collections import Counter
-    wb, xlsx_bytes = load_any(file_bytes, filename)
-
-    cargo = []
-    for sh in wb.worksheets:
-        if sh.max_row < 2:
-            continue
-        hr, headers, col, lc, wc, hc, wtc, ul, uw = _scan(sh)
-        if all([lc, wc, hc, wtc]):
-            cargo.append((sh, hr, headers, col, lc, wc, hc, wtc, ul, uw))
-    if not cargo:
-        raise ValueError("Couldn't find a tab with Length/Width/Height/Weight columns. "
-                         "If the cargo list is on a specific tab, make sure that tab has those headers.")
-
-    cur = xlsx_bytes
-    tot_pieces = tot_trucks = tot_ow = 0; tot_wt = 0.0
-    mix = Counter(); superloads = []; skipped = {"consolidated": 0, "zero": 0}; tabs = []
-    for (sh, hr, headers, col, lc, wc, hc, wtc, ul, uw) in cargo:
-        items, skip = _rows_for(sh, hr, col, lc, wc, hc, wtc, ul, uw)
-        if not items:
-            continue
-        _, trucks = best_pack(items)
-        groups = [{"rows": sorted(t["rows"]), "eq": label(t["rows"], items)} for t in trucks]
-        keep = []
-        for _k, idx in [("desc", col["desc"]), ("case", col["case"]),
-                        (None, lc), (None, wc), (None, hc), (None, wtc)]:
-            if idx:
-                keep.append(headers[idx])
-        rows_spec, gid = [], 0
-        for g in groups:
-            gid += 1
-            for r in g["rows"]:
-                rows_spec.append({"excel_row": r,
-                    "length": {"value": num(sh.cell(r, lc).value), "unit": ul},
-                    "width":  {"value": num(sh.cell(r, wc).value), "unit": ul},
-                    "height": {"value": num(sh.cell(r, hc).value), "unit": ul},
-                    "weight": {"value": num(sh.cell(r, wtc).value), "unit": uw},
-                    "equipment": g["eq"], "truck": "g%03d" % gid, "rate": None})
-        rows_spec.sort(key=lambda x: x["excel_row"])
-        tin = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False); tin.write(cur); tin.close()
-        tout = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False); tout.close()
-        build({"input_file": tin.name, "output_file": tout.name, "sheet": sh.title,
-               "header_row": hr, "keep_visible": keep, "rows": rows_spec})
-        cur = open(tout.name, "rb").read(); os.unlink(tin.name); os.unlink(tout.name)
-
-        s = make_summary(items, groups, skip, len(items))
-        tot_pieces += s["pieces"]; tot_trucks += s["trucks"]; tot_ow += s["over_width_pieces"]; tot_wt += s["total_weight_lb"]
-        for k, v in s["equipment_mix"].items():
-            mix[k] += v
-        for row, reason in s["superloads"]:
-            superloads.append(("%s (%s)" % (row, sh.title), reason))
-        skipped["consolidated"] += skip["consolidated"]; skipped["zero"] += skip["zero"]
-        tabs.append({"tab": sh.title, "trucks": s["trucks"], "pieces": s["pieces"]})
-
-    if tot_pieces == 0:
+    if not items:
         raise ValueError("No cargo rows found.")
-    summary = {"pieces": tot_pieces, "trucks": tot_trucks, "equipment_mix": dict(mix),
-               "over_width_pieces": tot_ow, "superloads": superloads, "skipped": skipped,
-               "total_weight_lb": round(tot_wt), "tabs": tabs}
-    return cur, summary
+
+    # consolidate (2-D packer, all current rules)
+    _, trucks = best_pack(items)
+    groups = [{"rows": sorted(t["rows"]), "eq": label(t["rows"], items)} for t in trucks]
+
+    # build spec for the formatter
+    keep = []
+    for key, idx in [("desc", col["desc"]), ("case", col["case"]),
+                     (None, lc), (None, wc), (None, hc), (None, wtc)]:
+        if idx:
+            keep.append(headers[idx])
+    rows_spec = []
+    gid = 0
+    for g in groups:
+        gid += 1
+        for r in g["rows"]:
+            rows_spec.append({
+                "excel_row": r,
+                "length": {"value": num(ws.cell(r, lc).value), "unit": ul},
+                "width":  {"value": num(ws.cell(r, wc).value), "unit": ul},
+                "height": {"value": num(ws.cell(r, hc).value), "unit": ul},
+                "weight": {"value": num(ws.cell(r, wtc).value), "unit": uw},
+                "equipment": g["eq"], "truck": "g%03d" % gid, "rate": None,
+            })
+    rows_spec.sort(key=lambda x: x["excel_row"])
+
+    # write input to a temp path for build_full (it loads by path); use BytesIO->file
+    import tempfile, os
+    tin = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False); tin.write(xlsx_bytes); tin.close()
+    tout = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False); tout.close()
+    spec = {"input_file": tin.name, "output_file": tout.name, "sheet": ws.title,
+            "header_row": header_row, "keep_visible": keep, "rows": rows_spec}
+    build(spec)
+    out_bytes = open(tout.name, "rb").read()
+    os.unlink(tin.name); os.unlink(tout.name)
+
+    summary = make_summary(items, groups, skipped, len(items))
+    return out_bytes, summary
 
 # ----------------------------------------------------------------- summary ---
 def make_summary(items, groups, skipped, n):
